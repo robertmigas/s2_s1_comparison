@@ -1,0 +1,229 @@
+var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR"),
+    geometry1 = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[21.491786467967472, 50.426200598644826],
+          [21.408015716014347, 50.469924629954676],
+          [21.314631926951847, 50.45768597370168],
+          [21.171809661326847, 50.366671065889044],
+          [21.164943206248722, 50.286889557886205],
+          [21.243220794139347, 50.215762552280125],
+          [21.493159758983097, 50.25616869302846]]]),
+    sentinel1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    geometry2 = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[20.601365983624873, 50.2957634977199],
+          [20.586259782453, 50.28260229427001],
+          [20.557420671124873, 50.263731554416836],
+          [20.55673402561706, 50.22992107502026],
+          [20.6356982590155, 50.16750636543502],
+          [20.7565478683905, 50.166186864549175],
+          [20.8334521652655, 50.17894051382768],
+          [20.92752259983581, 50.24046197932497],
+          [20.959108293195186, 50.27645915357682],
+          [20.953615129132686, 50.305412733526545],
+          [20.909669816632686, 50.313744589268126],
+          [20.816972673078, 50.31111363464384],
+          [20.71603578342956, 50.31725230231022],
+          [20.630205094953, 50.3080440035822]]]),
+    geometry3 = /* color: #98ff00 */ee.Geometry.Polygon(
+        [[[21.096373264727617, 50.30918250235576],
+          [21.071654026446367, 50.293173741650214],
+          [21.059981052813555, 50.271235186281935],
+          [21.15199155086043, 50.249506055146426],
+          [21.19765347712996, 50.26574896741686],
+          [21.207609836993242, 50.27452661422431],
+          [21.207266514239336, 50.29295440614869],
+          [21.13654202693465, 50.30786691702341]]]),
+    geometryob = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[21.382609832225285, 50.44979609867305],
+          [21.34553097480341, 50.448921641919526],
+          [21.374370086131535, 50.40955435991104],
+          [21.407329070506535, 50.43142911290781]]]),
+    s1_dry_mean = ee.Image("users/robertmigas/s1_dry_mean"),
+    our_polygon = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[20.591580781027808, 49.754835421129826],
+          [21.486780135606363, 49.655091514118396],
+          [21.831483084940544, 50.779986379364544],
+          [21.567746766936512, 50.809054624932486],
+          [20.475564338998073, 50.239190017340064],
+          [20.591580781027808, 49.754835421129826],
+          [20.591580781027808, 49.754835421129826]]]);
+          
+          //LIBRARIES
+// import Lee Filter - anti-speckle anti
+var external_functions = require("users/robertmigas/nowy:leefilter.js");
+
+
+//BACK-END
+
+function process(geometry, threshold, panel, season){
+
+
+//IMAGES
+//filtering Sentinel-1 image collection by chosen geometry and dates
+  var s1_collection = sentinel1
+    .filterMetadata('instrumentMode', 'equals', 'IW')
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+		.select("VV") // polarisation choice
+		.filterBounds(geometry) //geometry choice
+		.filterDate(season[0], season[1]) //date choice
+		.map(external_functions.lee_filter); //anti-speckle filter
+
+  // if images overlaps, then compute mean
+  var s1 = s1_collection.reduce(ee.Reducer.mean()); 
+
+  // filtering Sentinel-2 image collection by chosen geometry and dates
+  var s2 = sentinel2
+    .filterBounds(geometry)
+    .filterDate(season[0], season[1])
+    .map(maskS2clouds).mosaic();
+  
+  //FUNCTIONS
+  // function masking clouds in Sentinel-2 image
+  function maskS2clouds(image) {
+    var qa = image.select('QA60');
+
+    var cloudBitMask = 1 << 10;
+    var cirrusBitMask = 1 << 11;
+
+    var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+               qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+    return image.updateMask(mask)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]);
+  }
+
+  // function computing Sentinel Water Mask from Sentinel-2 image
+  function calculateSWM(image){
+    var SWM = image.select('B2').add(image.select('B3')).divide(image.select('B8').add(image.select('B11')));
+    return SWM;
+    }
+
+  // function applying threshold to SWM image
+  function thresholdSWM(image, threshold){
+   var SWM = image.select('B2').add(image.select('B3')).divide(image.select('B8').add(image.select('B11')));
+   return SWM.lt(threshold);
+  }
+  
+  //ANALYSIS
+  
+  //compute Sentinel Water Mask
+  var s2_SWM = calculateSWM(s2).clip(geometry);
+  //apply threshold to SWM image
+  var s2_SWM_th_0_5 = thresholdSWM(s2,0.5).clip(geometry);
+  
+  //subtract Sentinel-1 image from the mean summer level of VV polarisation
+  var s1_diff = s1_dry_mean.subtract(s1);
+  
+  //apply threshold to Sentinel-1 image
+  var s1_threshold = s1.clip(geometry).gt(threshold);
+
+  //create error matrix between SWM mask and Sentinel-1 threshold image
+  var histogram = s1_threshold.add(s2_SWM_th_0_5.multiply(10)).reduceRegion({
+    reducer: ee.Reducer.frequencyHistogram(),
+    geometry: geometryob,
+    scale: 10,
+    maxPixels:1e8,
+    bestEffort: true,
+  });
+  var stats = ee.Dictionary(histogram.get("sum_mean"));
+  //sum pixels in geometry
+  var pixels = ee.Number(s1_threshold.reduceRegion({
+			reducer: ee.Reducer.count(),
+			geometry: geometryob,
+			scale: 10
+		}).get("sum_mean"));
+  // compute True/False Positive/Negative
+  var TP = ee.Number(stats.get('0')).multiply(100).divide(pixels);
+  var TN = ee.Number(stats.get('11')).multiply(100).divide(pixels);
+  var FN = ee.Number(stats.get('1')).multiply(100).divide(pixels);
+  var FP = ee.Number(stats.get('10')).multiply(100).divide(pixels);
+  print("True positive: ", TP);
+  print("True negative: ", TN);
+  print("False negative: ", FN);
+  print("False positive: ", FP);
+  
+  
+  //RENDER
+  Map.clear();
+  Map.add(panel);
+  
+  
+  Map.centerObject(geometry);
+  // render images in given geometry
+  Map.addLayer(s2.clip(geometry), {bands: ['B4', 'B3', 'B2'], max: 3000}, 'Sentinel-2');
+  Map.addLayer(s2_SWM.clip(geometry),{},'SWM Sentinel-2');
+  Map.addLayer(s2_SWM_th_0_5.clip(geometry),{},'SWM S2 Threshold flood');
+  Map.addLayer(s1.clip(geometry), {}, 'Sentinel-1');
+  Map.addLayer(s1_threshold.clip(geometry),{},'Sentinel-1 threshold flood');
+  Map.addLayer(s1_diff.clip(geometry),{},'S1 - difference from mean summer level');
+  Map.addLayer(s1_diff.clip(geometry).lt(4), {}, 'S1 - difference from mean summer level - threshold = 4');
+  
+  return;
+}
+
+
+
+//UI
+// create panel on the right
+var panel = ui.Panel();
+panel.style().set({
+  width: '400px',
+  position: 'bottom-right'
+});
+
+//define given geometries
+var places = {
+  obszar1: geometry1,
+  obszar2: geometry2,
+  obszar3: geometry3,
+  obszarmaly: geometryob,
+  polygon: our_polygon,
+};
+
+//define given dates
+var seasons = {
+  Flood: [ee.Date("2019-05-23"), ee.Date("2019-05-26")], 
+  Spring: [ee.Date("2019-05-05"), ee.Date("2019-05-15")],
+  Summer: [ee.Date("2019-08-26"), ee.Date("2019-08-29")]
+};
+
+//define threshold for Sentinel-1 (polarisation VV)
+var threshold = -17;
+var season = "";
+var slider = ui.Slider();
+slider.setMin(-25);
+slider.setMax(-10);
+slider.setValue(-17);
+slider.onChange(function(value){
+  threshold = value;
+});
+
+
+//create select button for given places
+var select = ui.Select({
+  items: Object.keys(places),
+  onChange: function(key){
+    var geometry = places[key];
+    process(geometry, threshold, panel, season);
+  }
+});
+select.setPlaceholder('Choose a geometry for analysis:');
+
+//create select button for given dates
+var selectSeason = ui.Select({
+  items: Object.keys(seasons),
+  onChange: function(key){
+    season = seasons[key];
+  }
+});
+
+
+//create panel with widgets
+Map.add(panel);
+
+panel.add(ui.Label('Select threshold:'));
+panel.add(slider);
+panel.add(ui.Label('Select season'));
+panel.add(selectSeason);
+panel.add(ui.Label('Select place:'));
+panel.add(select);
